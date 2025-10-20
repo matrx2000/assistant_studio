@@ -21,17 +21,16 @@ from PySide6.QtGui import QTextCursor, QTextCharFormat
 
 from openai import OpenAI
 
-import assistant_tools.config as tool_config
-from assistant_tools import FUNCTIONS, TOOLS
+from assistant_tools import API_KEY, FUNCTIONS, OLLAMA_BASE_URL, TOOLS, get_current_model
 
 # ----------------------------
 # Data classes
 # ----------------------------
 @dataclass
 class ChatConfig:
-    base_url: str = tool_config.OLLAMA_BASE_URL
-    model: str = field(default_factory=tool_config.get_current_model)
-    api_key: str = tool_config.API_KEY
+    base_url: str = OLLAMA_BASE_URL
+    model: str = field(default_factory=get_current_model)
+    api_key: str = API_KEY
     use_tools: bool = True
 
 # ----------------------------
@@ -141,7 +140,7 @@ class ChatWorker(QThread):
                     self.messages.append({"role": "tool", "tool_call_id": tc.id, "name": name, "content": content})
 
                 # pick up model changes
-                self.cfg.model = tool_config.get_current_model()
+                self.cfg.model = get_current_model()
 
                 if self.stream and not self._abort:
                     final_text = self._stream_final_answer(client)
@@ -200,8 +199,8 @@ class ChatWindow(QWidget):
         self.history = QTextEdit(); self.history.setReadOnly(True)
         self.input = QLineEdit(); self.input.setPlaceholderText("Type your message and press Enter...")
         self.send_btn = QPushButton("Send")
-        self.model_label = QLabel(f"Model: {tool_config.get_current_model()}")
-        self.base_label = QLabel(f"Base URL: {tool_config.OLLAMA_BASE_URL}")
+        self.model_label = QLabel(f"Model: {get_current_model()}")
+        self.base_label = QLabel(f"Base URL: {OLLAMA_BASE_URL}")
         self.tools_checkbox = QCheckBox("Enable tools"); self.tools_checkbox.setChecked(True)
         self.stream_checkbox = QCheckBox("Stream"); self.stream_checkbox.setChecked(True)
 
@@ -260,7 +259,7 @@ class ChatWindow(QWidget):
         self.history.ensureCursorVisible()
 
     def _refresh_model_label(self):
-        self.model_label.setText(f"Model: {tool_config.get_current_model()}")
+        self.model_label.setText(f"Model: {get_current_model()}")
 
     def on_send(self):
         content = self.input.text().strip()
@@ -277,9 +276,9 @@ class ChatWindow(QWidget):
         self.messages.append({"role": "user", "content": content})
 
         cfg = ChatConfig(
-            base_url=tool_config.OLLAMA_BASE_URL,
-            model=tool_config.get_current_model(),
-            api_key=tool_config.API_KEY,
+            base_url=OLLAMA_BASE_URL,
+            model=get_current_model(),
+            api_key=API_KEY,
             use_tools=self.tools_checkbox.isChecked(),
         )
 
