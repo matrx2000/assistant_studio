@@ -8,11 +8,9 @@ PySide6 Chat UI for Ollama (OpenAI-compatible API) with tools + STREAMING
 
 from __future__ import annotations
 import json
-import os
 import sys
-from dataclasses import dataclass
-from typing import Callable, Dict, List
-from urllib import request as _urlreq
+from dataclasses import dataclass, field
+from typing import List
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -23,166 +21,7 @@ from PySide6.QtGui import QTextCursor, QTextCharFormat
 
 from openai import OpenAI
 
-# ----------------------------
-# Configuration
-# ----------------------------
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
-MODEL = os.environ.get("OLLAMA_MODEL", "devstral:latest")
-API_KEY = os.environ.get("OLLAMA_API_KEY", "local")  # value ignored by Ollama; client requires a string
-
-# Active model pointer (updated by set_model tool)
-CURRENT_MODEL = MODEL
-
-def _ollama_host_base() -> str:
-    u = OLLAMA_BASE_URL.rstrip("/")
-    return u[:-3] if u.endswith("/v1") else u
-
-# ----------------------------
-# Tools
-# ----------------------------
-def add(a: float, b: float) -> str:
-    return json.dumps({"sum": a + b})
-
-def read_file(path: str, max_bytes: int = 4096) -> str:
-    norm = os.path.normpath(path)
-    if os.path.isabs(path) or ".." in norm.split(os.sep):
-        return json.dumps({"error": "unsafe_path"})
-    if not os.path.exists(norm):
-        return json.dumps({"error": "not_found"})
-    try:
-        with open(norm, "r", encoding="utf-8", errors="replace") as f:
-            data = f.read(max_bytes)
-        return json.dumps({"path": norm, "preview": data})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-def write_file(path: str, content: str, mode: str = "overwrite") -> str:
-    try:
-        norm = os.path.normpath(path)
-        if os.path.isabs(path) or ".." in norm.split(os.sep):
-            return json.dumps({"error": "unsafe_path", "path": path})
-        parent = os.path.dirname(norm)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        if mode not in ("overwrite", "append"):
-            return json.dumps({"error": "bad_mode", "allowed": ["overwrite", "append"]})
-        m = "w" if mode == "overwrite" else "a"
-        with open(norm, m, encoding="utf-8") as f:
-            f.write(content)
-        return json.dumps({"status": "ok", "path": norm, "mode": mode, "bytes_written": len(content)})
-    except Exception as e:
-        return json.dumps({"error": str(e), "path": path})
-
-def list_models() -> str:
-    # Try /v1/models via OpenAI client
-    try:
-        client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=API_KEY)
-        data = client.models.list()
-        names = []
-        for m in data.data:
-            name = getattr(m, "id", None) or getattr(m, "root", None) or getattr(m, "owned_by", None)
-            if name:
-                names.append({"name": name})
-        if names:
-            return json.dumps({"source": "v1/models", "models": names})
-    except Exception:
-        pass
-    # Fallback to native /api/tags
-    try:
-        url = _ollama_host_base().rstrip("/") + "/api/tags"
-        req = _urlreq.Request(url, method="GET")
-        with _urlreq.urlopen(req, timeout=5) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-        obj = json.loads(raw)
-        models = [{"name": m.get("name"), "size": m.get("size"), "modified_at": m.get("modified_at")}
-                  for m in obj.get("models", [])]
-        return json.dumps({"source": "api/tags", "models": models})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-def set_model(model: str, ensure_loaded: bool = True, unload_previous: bool = False) -> str:
-    """Switch CURRENT_MODEL; optionally warm it and unload previous (best-effort)."""
-    global CURRENT_MODEL
-    old = CURRENT_MODEL
-    errors: List[str] = []
-    CURRENT_MODEL = model
-    if ensure_loaded:
-        try:
-            client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=API_KEY)
-            _ = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=4,
-            )
-        except Exception as e:
-            CURRENT_MODEL = old
-            return json.dumps({"status": "failed", "error": f"ensure_failed: {e}", "old": old, "new": model})
-    if unload_previous and old and old != model:
-        host = _ollama_host_base().rstrip("/")
-        for path, body in (("/api/unload", {"model": old}),
-                           ("/api/stop", {"model": old}),
-                           ("/api/stop", {"name": old})):
-            try:
-                req = _urlreq.Request(
-                    host + path,
-                    data=json.dumps(body).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                _ = _urlreq.urlopen(req, timeout=3).read()
-                break
-            except Exception as e:
-                errors.append(f"{path}:{e}")
-    return json.dumps({"status": "ok", "old": old, "new": CURRENT_MODEL, "errors": errors})
-
-FUNCTIONS: Dict[str, Callable[..., str]] = {
-    "add": add,
-    "read_file": read_file,
-    "write_file": write_file,
-    "list_models": list_models,
-    "set_model": set_model,
-}
-
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "add",
-        "description": "Add two numbers and return the sum.",
-        "parameters": {"type": "object",
-                       "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
-                       "required": ["a", "b"], "additionalProperties": False},
-    }},
-    {"type": "function", "function": {
-        "name": "read_file",
-        "description": "Read a small UTF-8 text file (relative path, up to ~4KB).",
-        "parameters": {"type": "object",
-                       "properties": {"path": {"type": "string"},
-                                      "max_bytes": {"type": "integer", "default": 4096, "minimum": 1}},
-                       "required": ["path"], "additionalProperties": False},
-    }},
-    {"type": "function", "function": {
-        "name": "write_file",
-        "description": "Write UTF-8 text to a file (relative path only). Choose overwrite or append.",
-        "parameters": {"type": "object",
-                       "properties": {"path": {"type": "string"},
-                                      "content": {"type": "string"},
-                                      "mode": {"type": "string", "enum": ["overwrite", "append"], "default": "overwrite"}},
-                       "required": ["path", "content"], "additionalProperties": False},
-    }},
-    {"type": "function", "function": {
-        "name": "list_models",
-        "description": "List available local models from the Ollama server.",
-        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-    }},
-    {"type": "function", "function": {
-        "name": "set_model",
-        "description": "Switch the active chat model. Optionally ensure it is loaded and unload the previous one.",
-        "parameters": {"type": "object",
-                       "properties": {"model": {"type": "string"},
-                                      "ensure_loaded": {"type": "boolean", "default": True},
-                                      "unload_previous": {"type": "boolean", "default": False}},
-                       "required": ["model"], "additionalProperties": False},
-    }},
-]
+from assistant_tools import API_KEY, FUNCTIONS, OLLAMA_BASE_URL, TOOLS, get_current_model
 
 # ----------------------------
 # Data classes
@@ -190,7 +29,7 @@ TOOLS = [
 @dataclass
 class ChatConfig:
     base_url: str = OLLAMA_BASE_URL
-    model: str = CURRENT_MODEL
+    model: str = field(default_factory=get_current_model)
     api_key: str = API_KEY
     use_tools: bool = True
 
@@ -301,7 +140,7 @@ class ChatWorker(QThread):
                     self.messages.append({"role": "tool", "tool_call_id": tc.id, "name": name, "content": content})
 
                 # pick up model changes
-                self.cfg.model = CURRENT_MODEL
+                self.cfg.model = get_current_model()
 
                 if self.stream and not self._abort:
                     final_text = self._stream_final_answer(client)
@@ -360,7 +199,7 @@ class ChatWindow(QWidget):
         self.history = QTextEdit(); self.history.setReadOnly(True)
         self.input = QLineEdit(); self.input.setPlaceholderText("Type your message and press Enter...")
         self.send_btn = QPushButton("Send")
-        self.model_label = QLabel(f"Model: {CURRENT_MODEL}")
+        self.model_label = QLabel(f"Model: {get_current_model()}")
         self.base_label = QLabel(f"Base URL: {OLLAMA_BASE_URL}")
         self.tools_checkbox = QCheckBox("Enable tools"); self.tools_checkbox.setChecked(True)
         self.stream_checkbox = QCheckBox("Stream"); self.stream_checkbox.setChecked(True)
@@ -420,7 +259,7 @@ class ChatWindow(QWidget):
         self.history.ensureCursorVisible()
 
     def _refresh_model_label(self):
-        self.model_label.setText(f"Model: {CURRENT_MODEL}")
+        self.model_label.setText(f"Model: {get_current_model()}")
 
     def on_send(self):
         content = self.input.text().strip()
@@ -436,8 +275,12 @@ class ChatWindow(QWidget):
         self.input.clear()
         self.messages.append({"role": "user", "content": content})
 
-        cfg = ChatConfig(base_url=OLLAMA_BASE_URL, model=CURRENT_MODEL,
-                         api_key=API_KEY, use_tools=self.tools_checkbox.isChecked())
+        cfg = ChatConfig(
+            base_url=OLLAMA_BASE_URL,
+            model=get_current_model(),
+            api_key=API_KEY,
+            use_tools=self.tools_checkbox.isChecked(),
+        )
 
         self.worker = ChatWorker(self.messages, cfg, stream=self.stream_checkbox.isChecked())
         self.worker.result.connect(self.on_result)
